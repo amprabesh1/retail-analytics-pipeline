@@ -3,9 +3,15 @@ import shutil
 from datetime import datetime, timedelta
 
 import boto3
+from scripts.data_quality import (
+    check_metrics_quality,
+    check_warehouse_quality,
+)
 from scripts.incremental_load import (
+    build_behaviour_metrics,
     extract_user_purchase_incremental,
-    load_warehouse_and_metrics,
+    load_warehouse,
+    publish_metrics,
 )
 
 from airflow import DAG
@@ -103,9 +109,31 @@ with DAG(
         },
     )
 
+    # Write -> audit -> publish: the dashboard only sees data that passed
+    # the quality checks.
+    load_to_warehouse = PythonOperator(
+        task_id="load_warehouse",
+        python_callable=load_warehouse,
+    )
+
+    check_warehouse = PythonOperator(
+        task_id="check_warehouse_quality",
+        python_callable=check_warehouse_quality,
+    )
+
     get_user_behaviour_metric = PythonOperator(
         task_id="get_user_behaviour_metric",
-        python_callable=load_warehouse_and_metrics,
+        python_callable=build_behaviour_metrics,
+    )
+
+    check_metrics = PythonOperator(
+        task_id="check_metrics_quality",
+        python_callable=check_metrics_quality,
+    )
+
+    publish = PythonOperator(
+        task_id="publish_metrics",
+        python_callable=publish_metrics,
     )
 
     markdown_path = "/opt/airflow/dags/scripts/dashboard/"
@@ -124,6 +152,10 @@ with DAG(
 
     (
         [get_user_purchase_to_warehouse, get_movie_review_to_warehouse]
+        >> load_to_warehouse
+        >> check_warehouse
         >> get_user_behaviour_metric
+        >> check_metrics
+        >> publish
         >> gen_dashboard
     )

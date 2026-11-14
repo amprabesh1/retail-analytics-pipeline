@@ -8,9 +8,14 @@ Two pieces:
    s3://<bucket>/raw/user_purchase/ds=<ds>/, and records the window it
    loaded in the etl.watermark control table.
 
-2. load_warehouse_and_metrics: persistent DuckDB warehouse. Each run replaces
-   only its own ds partition (delete + insert) instead of rebuilding from one
-   overwritten file, then recomputes the behaviour metrics.
+2. load_warehouse: persistent DuckDB warehouse. Each run replaces only its
+   own ds partition (delete + insert) instead of rebuilding from one
+   overwritten file.
+
+3. build_behaviour_metrics / publish_metrics: the metric is built as a
+   warehouse table first, audited by data_quality.check_metrics_quality,
+   and only then published to the CSV the dashboard reads
+   (write -> audit -> publish).
 """
 
 from contextlib import closing
@@ -136,28 +141,39 @@ USER_PURCHASE_COLUMNS = """{
     'country': 'VARCHAR'
 }"""
 
-# Metric logic is unchanged from the original DAG; it now reads from the
-# warehouse tables instead of from raw files.
+# Aggregate each side to one row per customer *before* joining.
+# The original DAG joined purchases to reviews row by row and then summed,
+# so every purchase was counted once per review and every review once per
+# purchase (join fan-out). check_metrics_quality now guards against this.
 BEHAVIOUR_METRICS_SQL = """
-SELECT
-  up.customer_id,
-  sum(up.quantity * up.unit_price) AS amount_spent,
-  sum(CASE WHEN mr.positive_review THEN 1 ELSE 0 END)
-    AS num_positive_reviews,
-  count(mr.cid) AS num_reviews
-FROM user_purchase up
-JOIN movie_review mr ON up.customer_id = mr.cid
-GROUP BY up.customer_id
+WITH purchases AS (
+  SELECT customer_id, sum(quantity * unit_price) AS amount_spent
+  FROM user_purchase
+  WHERE customer_id IS NOT NULL
+  GROUP BY customer_id
+),
+reviews AS (
+  SELECT cid,
+         sum(CASE WHEN positive_review THEN 1 ELSE 0 END)
+           AS num_positive_reviews,
+         count(*) AS num_reviews
+  FROM movie_review
+  GROUP BY cid
+)
+SELECT p.customer_id, p.amount_spent, r.num_positive_reviews, r.num_reviews
+FROM purchases p
+JOIN reviews r ON p.customer_id = r.cid
 """
 
+DEFAULT_DB_PATH = "/opt/airflow/temp/warehouse.duckdb"
 
-def load_warehouse_and_metrics(
+
+def load_warehouse(
     ds,
     local_root="/opt/airflow/temp/s3folder",
-    db_path="/opt/airflow/temp/warehouse.duckdb",
-    metrics_csv="/opt/airflow/data/behaviour_metrics.csv",
+    db_path=DEFAULT_DB_PATH,
 ):
-    """Upsert this run's partition into DuckDB and rebuild the metrics CSV."""
+    """Upsert this run's purchases and the latest review snapshot."""
     import duckdb
 
     purchase_csv = f"{local_root}/raw/user_purchase/ds={ds}/user_purchase.csv"
@@ -205,9 +221,6 @@ def load_warehouse_and_metrics(
             """,
             [ds],
         )
-        con.execute(
-            f"COPY ({BEHAVIOUR_METRICS_SQL}) TO '{metrics_csv}' (HEADER)"
-        )
         con.execute("COMMIT")
         total = con.execute("SELECT count(*) FROM user_purchase").fetchone()
         print(f"ds={ds}: warehouse user_purchase now has {total[0]} rows")
@@ -216,3 +229,32 @@ def load_warehouse_and_metrics(
         raise
     finally:
         con.close()
+
+
+def build_behaviour_metrics(ds, db_path=DEFAULT_DB_PATH):
+    """Write step: rebuild the behaviour_metrics table (not yet published)."""
+    import duckdb
+
+    with closing(duckdb.connect(db_path)) as con:
+        con.execute(
+            "CREATE OR REPLACE TABLE behaviour_metrics AS "
+            + BEHAVIOUR_METRICS_SQL
+        )
+        n = con.execute("SELECT count(*) FROM behaviour_metrics").fetchone()
+    print(f"ds={ds}: built behaviour_metrics with {n[0]} customers")
+
+
+def publish_metrics(
+    ds,
+    db_path=DEFAULT_DB_PATH,
+    metrics_csv="/opt/airflow/data/behaviour_metrics.csv",
+):
+    """Publish step: runs only after check_metrics_quality has passed."""
+    import duckdb
+
+    with closing(duckdb.connect(db_path)) as con:
+        con.execute(
+            "COPY (SELECT * FROM behaviour_metrics ORDER BY customer_id) "
+            f"TO '{metrics_csv}' (HEADER)"
+        )
+    print(f"ds={ds}: published behaviour_metrics to {metrics_csv}")

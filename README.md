@@ -3,6 +3,8 @@
 >
 > **My contributions** (on the [`my-extensions`](https://github.com/amprabesh1/retail-analytics-pipeline/tree/my-extensions) branch):
 > 1. **Incremental loading.** The Postgres extract uses a high-watermark on `invoice_date`, stored in an `etl.watermark` control table, instead of `select *`. Runs are keyed by Airflow's `{{ ds }}`: each run writes its own S3 partition (`ds=YYYY-MM-DD/`), Spark uses dynamic partition overwrite, and a persistent DuckDB warehouse replaces only the current run's rows. Re-running a date is idempotent.
+> 2. **Data quality checks (write → audit → publish).** 16 SQL checks in `dags/scripts/data_quality.py` run at two gates: on each run's loaded rows (keys, invoice formats, rules for returns, write-offs and adjustments taken from profiling the data, plus a row-count reconciliation against the watermark table), and on the metric before it is published. Error checks stop the run so the dashboard keeps its last good data, warnings are only logged, and every result is stored in a `dq_results` table.
+>    - **This changes the original metric.** The metric checks caught a join fan-out bug in the original SQL: purchases were joined to reviews row by row before summing, which inflated `amount_spent` and `num_reviews` for all 908 customers (for example, 303,354 reviews reported for a customer with 38). The metric now aggregates each table per customer before joining.
 >
 > *Setup fixes needed to run it in 2026 (not features):*
 > - The Airflow image builds natively on Apple Silicon/arm64: `JAVA_HOME` and the Quarto download now depend on the CPU architecture.
