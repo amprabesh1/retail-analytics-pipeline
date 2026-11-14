@@ -42,7 +42,9 @@ services:
       retries: 5
     restart: always
     ports:
-      - "5432:5432"
+      # Host port 5434 avoids clashing with a local Postgres on 5432;
+      # containers still talk to postgres:5432 on the Docker network.
+      - "5434:5432"
 
   airflow-webserver:
     <<: *airflow-common
@@ -89,7 +91,9 @@ services:
       _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
 
   minio:
-    image: 'minio/minio:latest'
+    # minio/minio was removed from Docker Hub in 2025; Chainguard's image is
+    # built from MinIO source. Pinned by digest for reproducibility.
+    image: 'chainguard/minio@sha256:ddfab4c402bf32e7701600d16d8c40dbccfab4c4e5340eef4c324394349c7926'
     hostname: minio
     container_name: minio
     ports:

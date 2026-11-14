@@ -1,4 +1,6 @@
 FROM apache/airflow:2.9.2
+# Set by Docker to amd64 or arm64; lets the image build natively on Apple Silicon.
+ARG TARGETARCH
 COPY requirements.txt /
 RUN pip install --no-cache-dir -r /requirements.txt
 
@@ -30,7 +32,7 @@ RUN chmod 755 spark-3.5.1-bin-hadoop3.tgz
 # Create the target directory and extract the tarball to it
 RUN mkdir -p /opt/spark && tar xvzf spark-3.5.1-bin-hadoop3.tgz --directory /opt/spark --strip-components=1
 
-ENV JAVA_HOME='/usr/lib/jvm/java-17-openjdk-amd64'
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-${TARGETARCH}
 ENV PATH=$PATH:$JAVA_HOME/bin
 ENV SPARK_HOME='/opt/spark'
 ENV PATH=$PATH:$SPARK_HOME/bin:$SPARK_HOME/sbin
