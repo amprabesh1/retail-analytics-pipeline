@@ -1,0 +1,6 @@
+[flake8]
+max-line-length = 79
+exclude = .git,__pycache__,logs,temp,plugins
+# The Spark packages line is from the original project; left as-is.
+per-file-ignores =
+    dags/scripts/spark/random_text_classification.py: E501

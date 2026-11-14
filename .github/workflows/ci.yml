@@ -1,15 +1,102 @@
-# NOTE: uncomment to run CI
-# name: CI
-# on: [pull_request]
-# jobs:
-#   run-ci-tests:
-#     runs-on: ubuntu-latest
-#     steps:
-#       - name: checkout repo
-#         uses: actions/checkout@v2
-#       - name: Grant perms
-#         run: make perms
-#       - name: Spin up containers
-#         run: make up
-#       - name: Run CI test
-#         run: make ci
+name: CI
+
+# unit-tests: every push and pull request (about a minute).
+# pipeline:   pull requests and manual runs (builds the Docker stack and
+#             runs the whole DAG end to end; slower).
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch cancels the older, still-running build.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit tests and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Same versions as the Airflow image (containers/airflow).
+      - name: Install test dependencies
+        run: pip install duckdb==1.1.0 pandas==2.1.4 pytest==8.2.2 flake8==7.0.0
+
+      - name: Lint
+        run: flake8 dags tests
+
+      - name: Unit tests
+        run: pytest -v tests/unit
+
+  pipeline:
+    name: Full pipeline in Docker
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same folders and permissions as `make perms`.
+      - name: Prepare mounted folders
+        run: |
+          mkdir -p logs plugins temp dags tests data visualization
+          chmod -R 777 logs plugins temp dags tests data visualization
+
+      - name: Build images
+        run: docker compose build
+
+      - name: Start the stack
+        run: |
+          docker compose up airflow-init
+          docker compose up -d
+
+      - name: Wait for the scheduler
+        run: |
+          for i in $(seq 1 60); do
+            if docker exec scheduler airflow jobs check --job-type SchedulerJob; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Scheduler did not become healthy in time"
+          exit 1
+
+      - name: Create Airflow connections
+        run: docker exec scheduler python /opt/airflow/setup_conn.py
+
+      - name: All tests inside the Airflow image (includes DAG import test)
+        run: docker exec webserver pytest -v /opt/airflow/tests
+
+      # Runs every task: extract, Spark, load, quality checks, metrics,
+      # publish and dashboard. Fails the job if any task fails.
+      - name: Run the DAG end to end
+        run: docker exec scheduler airflow dags test user_analytics_dag 2026-11-01
+
+      - name: Show what the run loaded and checked
+        run: |
+          docker exec postgres psql -U airflow -c \
+            "select ds, high_watermark, row_count from etl.watermark"
+          docker exec scheduler python -c "
+          import duckdb
+          con = duckdb.connect('/opt/airflow/temp/warehouse.duckdb', read_only=True)
+          con.sql('select stage, check_name, severity, passed, failing_rows from dq_results order by stage desc, check_name').show(max_width=200)
+          "
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose logs --tail=200
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v
