@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS etl.watermark (
 LOW_WATERMARK_SQL = """
 SELECT max(high_watermark)
 FROM etl.watermark
-WHERE source_table = %s AND ds < %s
+WHERE source_table = %s AND ds < %s::date
 """
 
 EXTRACT_SQL = """
@@ -60,7 +60,7 @@ ORDER BY invoice_date
 UPSERT_WATERMARK_SQL = """
 INSERT INTO etl.watermark
     (source_table, ds, low_watermark, high_watermark, row_count)
-VALUES (%s, %s, %s, %s, %s)
+VALUES (%s, %s::date, %s, %s, %s)
 ON CONFLICT (source_table, ds) DO UPDATE SET
     low_watermark  = EXCLUDED.low_watermark,
     high_watermark = EXCLUDED.high_watermark,
@@ -76,15 +76,24 @@ def extract_user_purchase_incremental(
     s3_key,
     postgres_conn_id="postgres_default",
     aws_conn_id="aws_default",
+    pg_hook=None,
+    s3_hook=None,
 ):
     """Extract new user_purchase rows for this run and record the watermark.
 
     Airflow fills in `ds` and `data_interval_end` from the task context.
+    `pg_hook` and `s3_hook` are only passed by unit tests (fakes); in Airflow
+    they are created from the connection ids.
     """
-    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-    from airflow.providers.postgres.hooks.postgres import PostgresHook
+    if pg_hook is None:
+        from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-    pg = PostgresHook(postgres_conn_id=postgres_conn_id)
+        pg_hook = PostgresHook(postgres_conn_id=postgres_conn_id)
+    if s3_hook is None:
+        from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+
+        s3_hook = S3Hook(aws_conn_id=aws_conn_id)
+    pg = pg_hook
 
     with closing(pg.get_conn()) as conn:
         with conn.cursor() as cur:
@@ -108,7 +117,7 @@ def extract_user_purchase_incremental(
 
     # A header-only file is still written when there are no new rows, so
     # downstream tasks always find this run's partition.
-    S3Hook(aws_conn_id=aws_conn_id).load_string(
+    s3_hook.load_string(
         df.to_csv(index=False),
         key=s3_key,
         bucket_name=s3_bucket,
@@ -167,6 +176,20 @@ JOIN reviews r ON p.customer_id = r.cid
 
 DEFAULT_DB_PATH = "/opt/airflow/temp/warehouse.duckdb"
 
+USER_PURCHASE_DDL = """
+CREATE TABLE IF NOT EXISTS user_purchase (
+    invoice_number VARCHAR,
+    stock_code VARCHAR,
+    detail VARCHAR,
+    quantity INTEGER,
+    invoice_date TIMESTAMP,
+    unit_price DECIMAL(8,3),
+    customer_id INTEGER,
+    country VARCHAR,
+    ds DATE
+)
+"""
+
 
 def load_warehouse(
     ds,
@@ -182,21 +205,7 @@ def load_warehouse(
     con = duckdb.connect(db_path)
     try:
         con.execute("BEGIN TRANSACTION")
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_purchase (
-                invoice_number VARCHAR,
-                stock_code VARCHAR,
-                detail VARCHAR,
-                quantity INTEGER,
-                invoice_date TIMESTAMP,
-                unit_price DECIMAL(8,3),
-                customer_id INTEGER,
-                country VARCHAR,
-                ds DATE
-            )
-            """
-        )
+        con.execute(USER_PURCHASE_DDL)
         # Idempotent append: wipe this ds, then insert it again.
         con.execute("DELETE FROM user_purchase WHERE ds = ?::DATE", [ds])
         con.execute(
