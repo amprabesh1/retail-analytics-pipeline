@@ -41,8 +41,12 @@ def random_text_classifier(
         array_contains(df_clean.review_clean, "good").alias("positive_review"),
     )
     df_fin = df_out.withColumn("insert_date", lit(run_id))
-    # parquet is a popular column storage format, we use it here
-    df_fin.write.mode("overwrite").parquet(output_loc)
+    # parquet is a popular column storage format, we use it here.
+    # Partition by run date; with dynamic partition overwrite only this
+    # run's insert_date=<run_id> folder is replaced, earlier runs are kept.
+    df_fin.write.mode("overwrite").partitionBy("insert_date").parquet(
+        output_loc
+    )
 
 
 if __name__ == "__main__":
@@ -51,7 +55,10 @@ if __name__ == "__main__":
         "--input",
         type=str,
         help="HDFS input",
-        default="s3a://user-analytics/raw/movie_review.csv",
+        default=(
+            "s3a://user-analytics/raw/movie_review/ds=2024-05-05/"
+            "movie_review.csv"
+        ),
     )
     parser.add_argument(
         "--output",
@@ -78,6 +85,7 @@ if __name__ == "__main__":
             "org.apache.hadoop.fs.s3a.S3AFileSystem",
         )
         .config("spark.hadoop.fs.s3a.path.style.access", "true")
+        .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
         .getOrCreate()
     )
     random_text_classifier(

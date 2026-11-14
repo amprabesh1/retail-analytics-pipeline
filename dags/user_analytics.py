@@ -1,10 +1,12 @@
 import os
 import shutil
-import time
 from datetime import datetime, timedelta
 
 import boto3
-import duckdb
+from scripts.incremental_load import (
+    extract_user_purchase_incremental,
+    load_warehouse_and_metrics,
+)
 
 from airflow import DAG
 from airflow.operators.bash_operator import BashOperator
@@ -13,7 +15,6 @@ from airflow.providers.amazon.aws.operators.s3 import S3CreateBucketOperator
 from airflow.providers.amazon.aws.transfers.local_to_s3 import (
     LocalFilesystemToS3Operator,
 )
-from airflow.providers.amazon.aws.transfers.sql_to_s3 import SqlToS3Operator
 
 
 def get_s3_folder(
@@ -56,23 +57,32 @@ with DAG(
     movie_review_to_s3 = LocalFilesystemToS3Operator(
         task_id="movie_review_to_s3",
         filename="/opt/airflow/data/movie_review.csv",
-        dest_key="raw/movie_review.csv",
+        dest_key="raw/movie_review/ds={{ ds }}/movie_review.csv",
         dest_bucket=user_analytics_bucket,
         replace=True,
     )
 
-    user_purchase_to_s3 = SqlToS3Operator(
+    # Incremental: only rows newer than the stored watermark, one S3
+    # partition per run date.
+    user_purchase_to_s3 = PythonOperator(
         task_id="user_purchase_to_s3",
-        sql_conn_id="postgres_default",
-        query="select * from retail.user_purchase",
-        s3_bucket=user_analytics_bucket,
-        s3_key="raw/user_purchase/user_purchase.csv",
-        replace=True,
+        python_callable=extract_user_purchase_incremental,
+        op_kwargs={
+            "s3_bucket": user_analytics_bucket,
+            "s3_key": "raw/user_purchase/ds={{ ds }}/user_purchase.csv",
+        },
     )
 
     movie_classifier = BashOperator(
         task_id="movie_classifier",
-        bash_command="python /opt/airflow/dags/scripts/spark/random_text_classification.py",
+        bash_command=(
+            "python /opt/airflow/dags/scripts/spark/"
+            "random_text_classification.py"
+            " --input s3a://user-analytics/raw/movie_review/ds={{ ds }}/"
+            "movie_review.csv"
+            " --output s3a://user-analytics/clean/movie_review"
+            " --run-id {{ ds }}"
+        ),
     )
 
     get_movie_review_to_warehouse = PythonOperator(
@@ -80,7 +90,7 @@ with DAG(
         python_callable=get_s3_folder,
         op_kwargs={
             "s3_bucket": "user-analytics",
-            "s3_folder": "clean/movie_review",
+            "s3_folder": "clean/movie_review/insert_date={{ ds }}/",
         },
     )
 
@@ -89,43 +99,13 @@ with DAG(
         python_callable=get_s3_folder,
         op_kwargs={
             "s3_bucket": "user-analytics",
-            "s3_folder": "raw/user_purchase",
+            "s3_folder": "raw/user_purchase/ds={{ ds }}/",
         },
     )
 
-    def create_user_behaviour_metric():
-        time.sleep(30)
-        q = """
-        with up as (
-          select 
-            * 
-          from 
-            '/opt/airflow/temp/s3folder/raw/user_purchase/user_purchase.csv'
-        ), 
-        mr as (
-          select 
-            * 
-          from 
-            '/opt/airflow/temp/s3folder/clean/movie_review/*.parquet'
-        ) 
-        select 
-          up.customer_id, 
-          sum(up.quantity * up.unit_price) as amount_spent, 
-          sum(
-            case when mr.positive_review then 1 else 0 end
-          ) as num_positive_reviews, 
-          count(mr.cid) as num_reviews 
-        from 
-          up 
-          join mr on up.customer_id = mr.cid 
-        group by 
-          up.customer_id
-        """
-        duckdb.sql(q).write_csv("/opt/airflow/data/behaviour_metrics.csv")
-
     get_user_behaviour_metric = PythonOperator(
         task_id="get_user_behaviour_metric",
-        python_callable=create_user_behaviour_metric,
+        python_callable=load_warehouse_and_metrics,
     )
 
     markdown_path = "/opt/airflow/dags/scripts/dashboard/"

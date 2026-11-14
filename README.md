@@ -1,4 +1,14 @@
-
+> **Forked from [josephmachado/beginner_de_project](https://github.com/josephmachado/beginner_de_project) by Joseph Machado ([Start Data Engineering](https://www.startdataengineering.com/)).**
+> The original pipeline design, Docker setup, Spark job, DuckDB model, and dashboard are his work, released under the MIT License (see [LICENSE](LICENSE)).
+>
+> **My contributions** (on the [`my-extensions`](https://github.com/amprabesh1/beginner_de_project/tree/my-extensions) branch):
+> 1. **Incremental loading.** The Postgres extract uses a high-watermark on `invoice_date`, stored in an `etl.watermark` control table, instead of `select *`. Runs are keyed by Airflow's `{{ ds }}`: each run writes its own S3 partition (`ds=YYYY-MM-DD/`), Spark uses dynamic partition overwrite, and a persistent DuckDB warehouse replaces only the current run's rows. Re-running a date is idempotent.
+>
+> *Setup fixes needed to run it in 2026 (not features):*
+> - The Airflow image builds natively on Apple Silicon/arm64: `JAVA_HOME` and the Quarto download now depend on the CPU architecture.
+> - `cryptography` and `pyspark` are pinned. Unpinned installs had drifted to versions that broke `boto3` and Spark.
+> - The deleted `minio/minio` image is replaced with `chainguard/minio`.
+> - Postgres is exposed on host port `5434`.
 
 * [Beginner DE Project - Batch Edition](#beginner-de-project---batch-edition)
     * [Run Data Pipeline](#run-data-pipeline)
