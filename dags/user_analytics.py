@@ -54,6 +54,9 @@ with DAG(
     schedule_interval=timedelta(days=1),
     start_date=datetime(2023, 1, 1),
     catchup=False,
+    # One run at a time. Two runs at once would both read the watermark
+    # before either loaded, and both would load the same rows.
+    max_active_runs=1,
 ) as dag:
     user_analytics_bucket = "user-analytics"
 
