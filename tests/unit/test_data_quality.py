@@ -46,14 +46,24 @@ def failing(results):
     return {name for name, r in by_name(results).items() if not r.passed}
 
 
-def warehouse_checks(con, ds=DS, expected_rows=None):
+def warehouse_checks(con, ds=DS, expected_rows=None, expected_total=None):
     """Run the warehouse checks; by default expect what is actually loaded."""
     if expected_rows is None:
         expected_rows = con.execute(
             "SELECT count(*) FROM user_purchase WHERE ds = ?::DATE", [ds]
         ).fetchone()[0]
+    if expected_total is None:
+        expected_total = con.execute(
+            "SELECT count(*) FROM user_purchase"
+        ).fetchone()[0]
     return run_checks(
-        con, WAREHOUSE_CHECKS, {"ds": ds, "expected_rows": expected_rows}
+        con,
+        WAREHOUSE_CHECKS,
+        {
+            "ds": ds,
+            "expected_rows": expected_rows,
+            "expected_total_rows": expected_total,
+        },
     )
 
 
@@ -140,6 +150,22 @@ def test_row_count_mismatch_with_extract_is_caught(clean_warehouse):
     check = by_name(results)["row_count_matches_extract"]
     assert not check.passed
     assert check.failing_rows == 2
+
+
+def test_double_load_is_caught_by_the_total_but_not_per_date(
+    clean_warehouse,
+):
+    # The same 9 rows loaded again under a second date, while the
+    # watermark history only accounts for one batch of 9.
+    rows = clean_warehouse.execute("SELECT * FROM user_purchase").fetchall()
+    insert_purchases(clean_warehouse, [r[:-1] + ("2026-11-02",) for r in rows])
+
+    results = by_name(
+        warehouse_checks(clean_warehouse, ds="2026-11-02", expected_total=9)
+    )
+
+    assert results["row_count_matches_extract"].passed
+    assert results["warehouse_total_matches_watermarks"].failing_rows == 9
 
 
 def test_only_this_runs_rows_are_checked(clean_warehouse):

@@ -1,16 +1,20 @@
 """Incremental loading helpers for user_analytics_dag.
 
-Two pieces:
-
 1. extract_user_purchase_incremental: high-watermark extract from Postgres.
    Each run pulls only the rows whose invoice_date is newer than what earlier
-   runs already loaded, writes them to
-   s3://<bucket>/raw/user_purchase/ds=<ds>/, and records the window it
-   loaded in the etl.watermark control table.
+   runs already loaded and writes them to
+   s3://<bucket>/raw/user_purchase/ds=<ds>/. It returns the window it
+   extracted (low, high, rows), which Airflow passes on through XCom.
 
 2. load_warehouse: persistent DuckDB warehouse. Each run replaces only its
-   own ds partition (delete + insert) instead of rebuilding from one
-   overwritten file.
+   own ds partition (delete + insert) and, in the same transaction, records
+   the batch in the warehouse's etl.watermark table.
+
+   The watermark (the bookmark of what has been loaded) lives in the same
+   DuckDB file as the data and is committed atomically with it. They cannot
+   drift apart: resetting Postgres no longer forgets what the warehouse holds
+   (which used to reload every row on top of the old ones), deleting the
+   warehouse also deletes its bookmark, and a failed load advances neither.
 
 3. build_behaviour_metrics / publish_metrics: the metric is built as a
    warehouse table first, audited by data_quality.check_metrics_quality,
@@ -23,18 +27,21 @@ from datetime import datetime
 
 SOURCE_TABLE = "retail.user_purchase"
 
+DEFAULT_DB_PATH = "/opt/airflow/temp/warehouse.duckdb"
+
 # Used as the low watermark the very first time the pipeline runs.
 INITIAL_WATERMARK = datetime(1900, 1, 1)
 
+# Lives in the DuckDB warehouse, next to the rows it describes.
 WATERMARK_DDL = """
 CREATE SCHEMA IF NOT EXISTS etl;
 CREATE TABLE IF NOT EXISTS etl.watermark (
-    source_table   text      NOT NULL,
-    ds             date      NOT NULL,
-    low_watermark  timestamp NOT NULL,
-    high_watermark timestamp NOT NULL,
-    row_count      integer   NOT NULL,
-    loaded_at      timestamp NOT NULL DEFAULT now(),
+    source_table   VARCHAR   NOT NULL,
+    ds             DATE      NOT NULL,
+    low_watermark  TIMESTAMP NOT NULL,
+    high_watermark TIMESTAMP NOT NULL,
+    row_count      INTEGER   NOT NULL,
+    loaded_at      TIMESTAMP NOT NULL DEFAULT current_timestamp,
     PRIMARY KEY (source_table, ds)
 );
 """
@@ -45,7 +52,7 @@ CREATE TABLE IF NOT EXISTS etl.watermark (
 LOW_WATERMARK_SQL = """
 SELECT max(high_watermark)
 FROM etl.watermark
-WHERE source_table = %s AND ds < %s::date
+WHERE source_table = ? AND ds < ?::DATE
 """
 
 EXTRACT_SQL = """
@@ -57,16 +64,15 @@ WHERE invoice_date > %(low)s
 ORDER BY invoice_date
 """
 
-UPSERT_WATERMARK_SQL = """
-INSERT INTO etl.watermark
-    (source_table, ds, low_watermark, high_watermark, row_count)
-VALUES (%s, %s::date, %s, %s, %s)
-ON CONFLICT (source_table, ds) DO UPDATE SET
-    low_watermark  = EXCLUDED.low_watermark,
-    high_watermark = EXCLUDED.high_watermark,
-    row_count      = EXCLUDED.row_count,
-    loaded_at      = now()
-"""
+
+def read_low_watermark(ds, db_path=DEFAULT_DB_PATH):
+    """Highest invoice_date the warehouse holds from runs before ds."""
+    import duckdb
+
+    with closing(duckdb.connect(db_path)) as con:
+        con.execute(WATERMARK_DDL)
+        low = con.execute(LOW_WATERMARK_SQL, [SOURCE_TABLE, ds]).fetchone()
+    return low[0] or INITIAL_WATERMARK
 
 
 def extract_user_purchase_incremental(
@@ -74,16 +80,20 @@ def extract_user_purchase_incremental(
     data_interval_end,
     s3_bucket,
     s3_key,
+    db_path=DEFAULT_DB_PATH,
     postgres_conn_id="postgres_default",
     aws_conn_id="aws_default",
     pg_hook=None,
     s3_hook=None,
 ):
-    """Extract new user_purchase rows for this run and record the watermark.
+    """Extract new user_purchase rows for this run.
 
     Airflow fills in `ds` and `data_interval_end` from the task context.
     `pg_hook` and `s3_hook` are only passed by unit tests (fakes); in Airflow
     they are created from the connection ids.
+
+    The watermark is not advanced here: load_warehouse records it together
+    with the rows, from the window this function returns.
     """
     if pg_hook is None:
         from airflow.providers.postgres.hooks.postgres import PostgresHook
@@ -93,20 +103,14 @@ def extract_user_purchase_incremental(
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
         s3_hook = S3Hook(aws_conn_id=aws_conn_id)
-    pg = pg_hook
 
-    with closing(pg.get_conn()) as conn:
-        with conn.cursor() as cur:
-            cur.execute(WATERMARK_DDL)
-            cur.execute(LOW_WATERMARK_SQL, (SOURCE_TABLE, ds))
-            low = cur.fetchone()[0] or INITIAL_WATERMARK
-        conn.commit()
+    low = read_low_watermark(ds, db_path)
 
     # Upper bound = end of this run's data interval, so a run never picks up
     # rows "from the future" relative to its own logical date.
     upper = data_interval_end.in_timezone("UTC").naive()
 
-    df = pg.get_pandas_df(
+    df = pg_hook.get_pandas_df(
         EXTRACT_SQL, parameters={"low": low, "upper": upper}
     )
     # Nullable ints keep customer_id as 17850, not 17850.0, in the CSV.
@@ -124,16 +128,8 @@ def extract_user_purchase_incremental(
         replace=True,
     )
 
-    # Only advance the watermark after the data has landed in S3.
-    with closing(pg.get_conn()) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                UPSERT_WATERMARK_SQL, (SOURCE_TABLE, ds, low, high, len(df))
-            )
-        conn.commit()
-
     print(
-        f"ds={ds}: loaded {len(df)} rows with invoice_date in "
+        f"ds={ds}: extracted {len(df)} rows with invoice_date in "
         f"({low}, {high}] (upper bound {upper})"
     )
     return {"ds": ds, "low": str(low), "high": str(high), "rows": len(df)}
@@ -174,8 +170,6 @@ FROM purchases p
 JOIN reviews r ON p.customer_id = r.cid
 """
 
-DEFAULT_DB_PATH = "/opt/airflow/temp/warehouse.duckdb"
-
 USER_PURCHASE_DDL = """
 CREATE TABLE IF NOT EXISTS user_purchase (
     invoice_number VARCHAR,
@@ -191,13 +185,29 @@ CREATE TABLE IF NOT EXISTS user_purchase (
 """
 
 
+EXTRACT_TASK_ID = "user_purchase_to_s3"
+
+
 def load_warehouse(
     ds,
+    ti=None,
+    extract=None,
     local_root="/opt/airflow/temp/s3folder",
     db_path=DEFAULT_DB_PATH,
 ):
-    """Upsert this run's purchases and the latest review snapshot."""
+    """Upsert this run's purchases, its watermark and the review snapshot.
+
+    `extract` is what extract_user_purchase_incremental returned. In Airflow
+    it is pulled from XCom through `ti`; unit tests pass it directly.
+    """
     import duckdb
+
+    if extract is None:
+        extract = ti.xcom_pull(task_ids=EXTRACT_TASK_ID)
+    if not extract or extract.get("ds") != ds:
+        raise ValueError(
+            f"ds={ds}: no extract result for this run (got {extract!r})"
+        )
 
     purchase_csv = f"{local_root}/raw/user_purchase/ds={ds}/user_purchase.csv"
     review_glob = f"{local_root}/clean/movie_review/insert_date={ds}/*.parquet"
@@ -206,6 +216,7 @@ def load_warehouse(
     try:
         con.execute("BEGIN TRANSACTION")
         con.execute(USER_PURCHASE_DDL)
+        con.execute(WATERMARK_DDL)
         # Idempotent append: wipe this ds, then insert it again.
         con.execute("DELETE FROM user_purchase WHERE ds = ?::DATE", [ds])
         con.execute(
@@ -217,6 +228,28 @@ def load_warehouse(
                           columns = {USER_PURCHASE_COLUMNS})
             """,
             [ds],
+        )
+        # Record the batch in the same transaction as its rows: both are
+        # committed, or neither is. (An upsert, because DuckDB rejects
+        # deleting and re-inserting a primary key in one transaction.)
+        con.execute(
+            """
+            INSERT INTO etl.watermark
+                (source_table, ds, low_watermark, high_watermark, row_count)
+            VALUES (?, ?::DATE, ?::TIMESTAMP, ?::TIMESTAMP, ?)
+            ON CONFLICT (source_table, ds) DO UPDATE SET
+                low_watermark  = EXCLUDED.low_watermark,
+                high_watermark = EXCLUDED.high_watermark,
+                row_count      = EXCLUDED.row_count,
+                loaded_at      = now()
+            """,
+            [
+                SOURCE_TABLE,
+                ds,
+                extract["low"],
+                extract["high"],
+                extract["rows"],
+            ],
         )
         # Movie reviews have no timestamp, so each run is a full snapshot;
         # keep the latest snapshot only.

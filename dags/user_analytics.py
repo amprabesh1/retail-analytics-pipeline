@@ -68,8 +68,9 @@ with DAG(
         replace=True,
     )
 
-    # Incremental: only rows newer than the stored watermark, one S3
-    # partition per run date.
+    # Incremental: only rows newer than the warehouse's watermark, one S3
+    # partition per run date. The extracted window goes to load_warehouse
+    # through XCom, which records it together with the rows.
     user_purchase_to_s3 = PythonOperator(
         task_id="user_purchase_to_s3",
         python_callable=extract_user_purchase_incremental,

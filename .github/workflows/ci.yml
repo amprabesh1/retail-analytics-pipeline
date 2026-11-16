@@ -85,11 +85,10 @@ jobs:
 
       - name: Show what the run loaded and checked
         run: |
-          docker exec postgres psql -U airflow -c \
-            "select ds, high_watermark, row_count from etl.watermark"
           docker exec scheduler python -c "
           import duckdb
           con = duckdb.connect('/opt/airflow/temp/warehouse.duckdb', read_only=True)
+          con.sql('select ds, high_watermark, row_count from etl.watermark').show()
           con.sql('select stage, check_name, severity, passed, failing_rows from dq_results order by stage desc, check_name').show(max_width=200)
           "
 

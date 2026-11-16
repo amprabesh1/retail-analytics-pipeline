@@ -2,11 +2,11 @@
 > The original pipeline design, Docker setup, Spark job, DuckDB model, and dashboard are his work, released under the MIT License (see [LICENSE](LICENSE)).
 >
 > **My contributions** (on the [`my-extensions`](https://github.com/amprabesh1/retail-analytics-pipeline/tree/my-extensions) branch):
-> 1. **Incremental loading.** The Postgres extract uses a high-watermark on `invoice_date`, stored in an `etl.watermark` control table, instead of `select *`. Runs are keyed by Airflow's `{{ ds }}`: each run writes its own S3 partition (`ds=YYYY-MM-DD/`), Spark uses dynamic partition overwrite, and a persistent DuckDB warehouse replaces only the current run's rows. Re-running a date is idempotent.
-> 2. **Data quality checks (write → audit → publish).** 16 SQL checks in `dags/scripts/data_quality.py` run at two gates: on each run's loaded rows (keys, invoice formats, rules for returns, write-offs and adjustments taken from profiling the data, plus a row-count reconciliation against the watermark table), and on the metric before it is published. Error checks stop the run so the dashboard keeps its last good data, warnings are only logged, and every result is stored in a `dq_results` table.
+> 1. **Incremental loading.** The Postgres extract uses a high-watermark on `invoice_date`, instead of `select *`. The watermark is stored in an `etl.watermark` table inside the DuckDB warehouse and written in the same transaction as the rows it describes, so the bookmark and the data cannot drift apart (an earlier version kept it in Postgres, and a Postgres reset made the next run load every row a second time). Runs are keyed by Airflow's `{{ ds }}`: each run writes its own S3 partition (`ds=YYYY-MM-DD/`), Spark uses dynamic partition overwrite, and a persistent DuckDB warehouse replaces only the current run's rows. Re-running a date is idempotent.
+> 2. **Data quality checks (write → audit → publish).** 17 SQL checks in `dags/scripts/data_quality.py` run at two gates: on each run's loaded rows (keys, invoice formats, rules for returns, write-offs and adjustments taken from profiling the data, plus row-count reconciliations against the watermark table, both for the current run and for the warehouse total, which catches double loads), and on the metric before it is published. Error checks stop the run so the dashboard keeps its last good data, warnings are only logged, and every result is stored in a `dq_results` table.
 >    - **This changes the original metric.** The metric checks caught a join fan-out bug in the original SQL: purchases were joined to reviews row by row before summing, which inflated `amount_spent` and `num_reviews` for all 908 customers (for example, 303,354 reviews reported for a customer with 38). The metric now aggregates each table per customer before joining.
 > 3. **Unit tests and CI.** [![CI](https://github.com/amprabesh1/retail-analytics-pipeline/actions/workflows/ci.yml/badge.svg?branch=my-extensions)](https://github.com/amprabesh1/retail-analytics-pipeline/actions/workflows/ci.yml)
->    - 27 pytest unit tests in `tests/unit/` that need only `duckdb`, `pandas` and `pytest`. Each one builds a tiny in-memory warehouse. They cover the watermark logic (a fake Postgres runs the real SQL on DuckDB), idempotent re-runs, every data quality rule, and a hand-checkable reproduction of the fan-out bug. I confirmed the tests fail when that bug or the re-run bug is put back.
+>    - 32 pytest unit tests in `tests/unit/` that need only `duckdb`, `pandas` and `pytest`. Each one builds a tiny in-memory warehouse. They cover the watermark logic (a fake Postgres runs the real SQL on DuckDB), idempotent re-runs, the bookmark staying in sync with the warehouse after a Postgres reset or a failed load, every data quality rule, and a hand-checkable reproduction of the fan-out bug. I confirmed the tests fail when the fan-out bug, the re-run bug or the double-load bug is put back.
 >    - GitHub Actions (`.github/workflows/ci.yml`) runs lint and the unit tests on every push and pull request. On pull requests and manual runs it also builds the Docker stack on x86 and runs the whole DAG end to end.
 >
 > *Setup fixes needed to run it in 2026 (not features):*
@@ -56,7 +56,7 @@ Clone the repo and run the following commands to start the data pipeline:
 
 ```bash
 git clone https://github.com/josephmachado/beginner_de_project.git
-cd beginner_de_project 
+cd beginner_de_project
 make up
 sleep 30 # wait for Airflow to start
 make ci # run checks and tests

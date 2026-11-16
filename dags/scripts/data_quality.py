@@ -121,6 +121,16 @@ WAREHOUSE_CHECKS = [
         """,
     ),
     Check(
+        "warehouse_total_matches_watermarks",
+        ERROR,
+        "total rows in user_purchase equal the sum of row_count over every "
+        "loaded batch in etl.watermark (catches double loads and lost "
+        "batches)",
+        """
+        SELECT abs(count(*) - $expected_total_rows) FROM user_purchase
+        """,
+    ),
+    Check(
         "warehouse_not_empty",
         ERROR,
         "user_purchase has at least one row",
@@ -344,22 +354,28 @@ def _audit(ds, stage, checks, params, db_path):
     return [r.name for r in results if not r.passed]
 
 
-def check_warehouse_quality(
-    ds,
-    db_path="/opt/airflow/temp/warehouse.duckdb",
-    postgres_conn_id="postgres_default",
-):
-    """Airflow task: audit this run's loaded rows before metrics are built."""
-    from airflow.providers.postgres.hooks.postgres import PostgresHook
+def check_warehouse_quality(ds, db_path="/opt/airflow/temp/warehouse.duckdb"):
+    """Airflow task: audit this run's loaded rows before metrics are built.
 
-    row = PostgresHook(postgres_conn_id=postgres_conn_id).get_first(
-        "SELECT row_count FROM etl.watermark "
-        "WHERE source_table = 'retail.user_purchase' AND ds = %s",
-        parameters=(ds,),
-    )
-    if row is None:
+    The expected row counts come from etl.watermark, which load_warehouse
+    keeps in the same DuckDB file as the rows.
+    """
+    import duckdb
+
+    with closing(duckdb.connect(db_path)) as con:
+        row = con.execute(
+            "SELECT max(row_count) FILTER (WHERE ds = ?::DATE), "
+            "       coalesce(sum(row_count), 0) "
+            "FROM etl.watermark WHERE source_table = 'retail.user_purchase'",
+            [ds],
+        ).fetchone()
+    if row is None or row[0] is None:
         raise DataQualityError(f"No etl.watermark row for ds={ds}")
-    params = {"ds": ds, "expected_rows": row[0]}
+    params = {
+        "ds": ds,
+        "expected_rows": row[0],
+        "expected_total_rows": row[1],
+    }
     return _audit(ds, "warehouse", WAREHOUSE_CHECKS, params, db_path)
 
 
