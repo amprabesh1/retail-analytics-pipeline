@@ -1,73 +1,169 @@
 ---
-title: "CoinCap Exchange Dashboard"
+title: "Retail Customer Analytics"
 author: "StartDataEngineering"
-format: dashboard
+format:
+  dashboard:
+    # Scroll instead of squeezing every chart into one screen height.
+    scrolling: true
 ---
 
-## Row {height=70%}
-
 ```{python}
-#| title: User Behaviour Metrics data analysis
+#| include: false
+import os
+
 import pandas as pd
 import plotly.express as px
-import os
-# Load the CSV file
-file_path = f'{os.getenv("AIRFLOW_HOME")}/data/behaviour_metrics.csv'
 
-import duckdb as d
-d.sql(f"create table bm as SELECT * FROM '{file_path}'")
+# Published by the publish_metrics task, only after the quality checks pass.
+bm = pd.read_csv(f'{os.getenv("AIRFLOW_HOME")}/data/behaviour_metrics.csv')
 
-# Query for average spending per customer
-avg_spent_query = "SELECT AVG(amount_spent) AS average_spent FROM bm;"
-average_spent = d.sql(avg_spent_query).fetchdf()
+# One series per chart, so one colour; text stays in neutral greys.
+BLUE = "#2a78d6"
+INK = "#52514e"
+GRID = "#e8e7e3"
 
-# Plot for average spending
-fig_avg_spent = px.bar(average_spent, x=['Average Spending'], y='average_spent', title='Average Spending per Customer')
-fig_avg_spent.show()
+
+def show(fig, x_title, y_title):
+    """Apply the shared style and display the chart.
+
+    Quarto displays the value of every expression in a cell, so chart code
+    assigns each update to `fig` and only this function shows it, once.
+    """
+    fig = fig.update_traces(marker_color=BLUE)
+    fig = fig.update_layout(
+        template="plotly_white",
+        font=dict(color=INK, size=13),
+        margin=dict(l=10, r=10, t=10, b=10),
+        xaxis_title=x_title,
+        yaxis_title=y_title,
+        barcornerradius=4,
+        showlegend=False,
+    )
+    fig = fig.update_xaxes(gridcolor=GRID, zeroline=False)
+    fig = fig.update_yaxes(gridcolor=GRID, zeroline=False)
+    fig.show()
 ```
 
-## Row {height=30%}
+## Row
 
 ```{python}
-#| title: User Behaviour Metrics data analysis
-import pandas as pd
-import plotly.express as px
-import os
-# Load the CSV file
-file_path = f'{os.getenv("AIRFLOW_HOME")}/data/behaviour_metrics.csv'
+#| content: valuebox
+#| title: "Customers"
+dict(icon="people", value=f"{len(bm):,}")
+```
 
-import duckdb as d
-d.sql(f"create table bm2 as SELECT * FROM '{file_path}'")
+```{python}
+#| content: valuebox
+#| title: "Net revenue (after returns)"
+dict(icon="currency-pound", value=f"£{bm['amount_spent'].sum() / 1e6:.2f}M")
+```
 
-# Query for spending distribution
-spending_dist_query = """
-WITH binned_data AS (
-    SELECT 
-        amount_spent,
-        CASE 
-            WHEN amount_spent < 10000 THEN '0-9999'
-            WHEN amount_spent >= 10000 AND amount_spent < 20000 THEN '10000-19999'
-            WHEN amount_spent >= 20000 AND amount_spent < 30000 THEN '20000-29999'
-            WHEN amount_spent >= 30000 AND amount_spent < 40000 THEN '30000-39999'
-            WHEN amount_spent >= 40000 AND amount_spent < 50000 THEN '40000-49999'
-            WHEN amount_spent >= 50000 AND amount_spent < 60000 THEN '50000-59999'
-            WHEN amount_spent >= 60000 AND amount_spent < 70000 THEN '60000-69999'
-            WHEN amount_spent >= 70000 AND amount_spent < 80000 THEN '70000-79999'
-            WHEN amount_spent >= 80000 AND amount_spent < 90000 THEN '80000-89999'
-            ELSE '90000+'
-        END AS spending_bin
-    FROM bm2
+```{python}
+#| content: valuebox
+#| title: "Average spend per customer"
+dict(icon="cart", value=f"£{bm['amount_spent'].mean():,.0f}")
+```
+
+```{python}
+#| content: valuebox
+#| title: "Reviews"
+dict(icon="chat-text", value=f"{bm['num_reviews'].sum():,}")
+```
+
+## Row
+
+```{python}
+#| title: Customers by net spend (£)
+# Returns can exceed purchases, so some customers have a negative net spend.
+buckets = [
+    ("Below 0", float("-inf"), 0),
+    ("0-500", 0, 500),
+    ("500-1k", 500, 1_000),
+    ("1k-2.5k", 1_000, 2_500),
+    ("2.5k-5k", 2_500, 5_000),
+    ("5k-10k", 5_000, 10_000),
+    ("10k+", 10_000, float("inf")),
+]
+dist = pd.DataFrame(
+    {
+        "bucket": [name for name, _, _ in buckets],
+        "customers": [
+            int(((bm["amount_spent"] >= lo) & (bm["amount_spent"] < hi)).sum())
+            for _, lo, hi in buckets
+        ],
+    }
 )
-SELECT 
-    spending_bin,
-    COUNT(*) AS count
-FROM binned_data
-GROUP BY spending_bin
-ORDER BY spending_bin;
-"""
-spending_distribution = d.sql(spending_dist_query).fetchdf()
-
-# Plot for spending distribution
-fig_spending_dist = px.bar(spending_distribution, x='spending_bin', y='count', title='Spending Distribution')
-fig_spending_dist.show()
+fig = px.bar(dist, x="bucket", y="customers", text="customers")
+fig = fig.update_traces(
+    textposition="outside",
+    cliponaxis=False,
+    hovertemplate="%{x}: %{y} customers<extra></extra>",
+)
+fig = fig.update_yaxes(range=[0, dist["customers"].max() * 1.15])
+show(fig, "Net spend (£)", "Customers")
 ```
+
+```{python}
+#| title: Top 10 customers by net spend (£)
+top = bm.nlargest(10, "amount_spent").assign(
+    customer=lambda df: df["customer_id"].astype(str),
+    label=lambda df: df["amount_spent"].map("£{:,.0f}".format),
+)
+fig = px.bar(top, x="amount_spent", y="customer", orientation="h", text="label")
+fig = fig.update_traces(
+    textposition="outside",
+    textfont_size=12,
+    constraintext="none",
+    cliponaxis=False,
+    width=0.6,
+    hovertemplate="Customer %{y}: £%{x:,.0f}<extra></extra>",
+)
+# dtick=1: label every customer, never every other one.
+fig = fig.update_yaxes(
+    categoryorder="total ascending", type="category", dtick=1
+)
+fig = fig.update_xaxes(range=[0, top["amount_spent"].max() * 1.25])
+show(fig, "Net spend (£)", "Customer")
+```
+
+## Row
+
+```{python}
+#| title: Net spend vs share of positive reviews
+# Log scale because spend is very skewed (median about £1.5k, top £279k);
+# a log axis cannot show spend <= 0, so those customers are left out here.
+pos = bm[bm["amount_spent"] > 0].assign(
+    positive_share=lambda df: df["num_positive_reviews"] / df["num_reviews"]
+)
+fig = px.scatter(
+    pos,
+    x="amount_spent",
+    y="positive_share",
+    log_x=True,
+    opacity=0.6,
+    custom_data=["customer_id", "num_positive_reviews", "num_reviews"],
+)
+fig = fig.update_traces(
+    marker=dict(size=8, line=dict(width=1, color="white")),
+    hovertemplate=(
+        "Customer %{customdata[0]}<br>Net spend £%{x:,.0f}<br>"
+        "%{customdata[1]} of %{customdata[2]} reviews positive"
+        "<extra></extra>"
+    ),
+)
+fig = fig.update_yaxes(tickformat=".0%")
+fig = fig.update_xaxes(
+    tickvals=[10, 100, 1_000, 10_000, 100_000],
+    ticktext=["£10", "£100", "£1k", "£10k", "£100k"],
+)
+show(fig, "Net spend (£, log scale)", "Positive reviews")
+```
+
+::: {.card title="How to read this chart"}
+Each dot is one customer with a positive net spend
+(`{python} f"{len(pos):,}"` of `{python} f"{len(bm):,}"`). The dots form a
+flat band: spend and the share of positive reviews are not related
+(correlation `{python} f"{pos['amount_spent'].corr(pos['positive_share']):.2f}"`).
+That is expected here: a review counts as positive when its text contains the
+word "good", and the reviews are linked to customers by id only for this demo.
+:::
