@@ -8,6 +8,7 @@
 > 3. **Unit tests and CI.** [![CI](https://github.com/amprabesh1/retail-analytics-pipeline/actions/workflows/ci.yml/badge.svg?branch=my-extensions)](https://github.com/amprabesh1/retail-analytics-pipeline/actions/workflows/ci.yml)
 >    - 32 pytest unit tests in `tests/unit/` that need only `duckdb`, `pandas` and `pytest`. Each one builds a tiny in-memory warehouse. They cover the watermark logic (a fake Postgres runs the real SQL on DuckDB), idempotent re-runs, the bookmark staying in sync with the warehouse after a Postgres reset or a failed load, every data quality rule, and a hand-checkable reproduction of the fan-out bug. I confirmed the tests fail when the fan-out bug, the re-run bug or the double-load bug is put back.
 >    - GitHub Actions (`.github/workflows/ci.yml`) runs lint and the unit tests on every push and pull request. On pull requests and manual runs it also builds the Docker stack on x86 and runs the whole DAG end to end.
+> 4. **Dashboard redesign.** The Quarto dashboard now shows the corrected metrics: number tiles (customers, net revenue, average spend, reviews), a spend distribution with a bucket for customers whose returns exceed their purchases, the top 10 customers by spend, and spend vs share of positive reviews. See the [screenshot](assets/images/dashboard.png).
 >
 > *Setup fixes needed to run it in 2026 (not features):*
 > - The Airflow image builds natively on Apple Silicon/arm64: `JAVA_HOME` and the Quarto download now depend on the CPU architecture.
