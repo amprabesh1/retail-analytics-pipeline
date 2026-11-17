@@ -75,7 +75,7 @@ jobs:
       - name: Create Airflow connections
         run: docker exec scheduler python /opt/airflow/setup_conn.py
 
-      - name: All tests inside the Airflow image (includes DAG import test)
+      - name: All tests inside the Airflow image (includes the DAG tests)
         run: docker exec webserver pytest -v /opt/airflow/tests
 
       # Runs every task: extract, Spark, load, quality checks, metrics,
