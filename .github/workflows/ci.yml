@@ -1,6 +1,6 @@
 name: CI
 
-# unit-tests: every push and pull request (about a minute).
+# unit-tests: every push (any branch) and pull request (about a minute).
 # pipeline:   pull requests and manual runs (builds the Docker stack and
 #             runs the whole DAG end to end; slower).
 on:
