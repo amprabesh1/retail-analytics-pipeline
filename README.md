@@ -2,7 +2,9 @@
 > The original pipeline design, Docker setup, Spark job, DuckDB model, and dashboard are his work, released under the MIT License (see [LICENSE](LICENSE)).
 >
 > **My contributions** (on the [`my-extensions`](https://github.com/amprabesh1/retail-analytics-pipeline/tree/my-extensions) branch):
-> 1. **Incremental loading.** The Postgres extract uses a high-watermark on `invoice_date`, instead of `select *`. The watermark is stored in an `etl.watermark` table inside the DuckDB warehouse and written in the same transaction as the rows it describes, so the bookmark and the data cannot drift apart (an earlier version kept it in Postgres, and a Postgres reset made the next run load every row a second time). Runs are keyed by Airflow's `{{ ds }}`: each run writes its own S3 partition (`ds=YYYY-MM-DD/`), Spark uses dynamic partition overwrite, and a persistent DuckDB warehouse replaces only the current run's rows. Re-running a date is idempotent.
+> 1. **Incremental loading.** The Postgres extract reads only rows newer than a high-watermark on `invoice_date`, instead of `select *`.
+>    - The watermark lives in an `etl.watermark` table inside the DuckDB warehouse and is written in the same transaction as the rows it describes, so the bookmark and the data cannot drift apart. (An earlier version kept it in Postgres, where a Postgres reset made the next run load every row a second time.)
+>    - Runs are keyed by Airflow's `{{ ds }}`: each run writes its own S3 partition (`ds=YYYY-MM-DD/`), Spark uses dynamic partition overwrite, and the persistent warehouse replaces only that run's rows, so re-running a date is idempotent. Only one run executes at a time (`max_active_runs=1`).
 > 2. **Data quality checks (write → audit → publish).** 17 SQL checks in `dags/scripts/data_quality.py` run at two gates: on each run's loaded rows (keys, invoice formats, rules for returns, write-offs and adjustments taken from profiling the data, plus row-count reconciliations against the watermark table, both for the current run and for the warehouse total, which catches double loads), and on the metric before it is published. Error checks stop the run so the dashboard keeps its last good data, warnings are only logged, and every result is stored in a `dq_results` table.
 >    - **This changes the original metric.** The metric checks caught a join fan-out bug in the original SQL: purchases were joined to reviews row by row before summing, which inflated `amount_spent` and `num_reviews` for all 908 customers (for example, 303,354 reviews reported for a customer with 38). The metric now aggregates each table per customer before joining.
 > 3. **Unit tests and CI.** [![CI](https://github.com/amprabesh1/retail-analytics-pipeline/actions/workflows/ci.yml/badge.svg?branch=my-extensions)](https://github.com/amprabesh1/retail-analytics-pipeline/actions/workflows/ci.yml)
@@ -28,13 +30,13 @@ Code for blog at [Data Engineering Project for Beginners](https://www.startdatae
 
 ## Run Data Pipeline
 
-Code available at **[beginner_de_project](https://github.com/josephmachado/beginner_de_project)** repository.
+Code available at the **[retail-analytics-pipeline](https://github.com/amprabesh1/retail-analytics-pipeline)** repository (forked from **[beginner_de_project](https://github.com/josephmachado/beginner_de_project)**).
 
 ### Run on codespaces
 
 You can run this data pipeline using GitHub codespaces. Follow the instructions below.
 
-1. Create codespaces by going to the **[beginner_de_project](https://github.com/josephmachado/beginner_de_project)** repository, cloning it(or click `Use this template` button) and then clicking on `Create codespaces on main` button.
+1. Go to the **[retail-analytics-pipeline](https://github.com/amprabesh1/retail-analytics-pipeline)** repository, click the green `Code` button, open the `Codespaces` tab and click `Create codespace on my-extensions`.
 2. Wait for codespaces to start, then in the terminal type `make up`.
 3. Wait for `make up` to complete, and then wait for 30s (for Airflow to start).
 4. After 30s go to the `ports` tab and click on the link exposing port `8080` to access Airflow UI (username and password is `airflow`).
@@ -56,14 +58,21 @@ To run locally, you need:
 Clone the repo and run the following commands to start the data pipeline:
 
 ```bash
-git clone https://github.com/josephmachado/beginner_de_project.git
-cd beginner_de_project
+git clone https://github.com/amprabesh1/retail-analytics-pipeline.git
+cd retail-analytics-pipeline
 make up
 sleep 30 # wait for Airflow to start
 make ci # run checks and tests
 ```
 
-Go to [http:localhost:8080](http:localhost:8080) to see the Airflow UI. Username and password are both `airflow`.
+Go to [http://localhost:8080](http://localhost:8080) to see the Airflow UI. Username and password are both `airflow`.
+
+The unit tests also run without Docker (Python 3.12):
+
+```bash
+pip install duckdb==1.1.0 pandas==2.1.4 pytest==8.2.2
+pytest tests/unit
+```
 
 ## Architecture
 
